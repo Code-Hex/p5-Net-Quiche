@@ -1,0 +1,11 @@
+Revision history for Net-Quiche
+
+{{$NEXT}}
+    - Prepare the existing 0.013 implementation for its first public release.
+    - Manage dependencies, metadata and distribution archives with Minilla.
+    - Include TLS test fixtures so native HTTP/3 tests run from a source archive.
+
+    The implementation includes the quiche C API binding, Perl-owned QUIC and
+    HTTP/3 objects, an IO::Async HTTP/3 client, and a PAGI UDP listener with
+    request streaming, response backpressure, GOAWAY and bounded shutdown.
+    PSGI applications use the optional PAGI::App::WrapPSGI adapter.

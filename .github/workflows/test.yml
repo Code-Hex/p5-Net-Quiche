@@ -1,0 +1,58 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        perl: ['5.34', '5.40']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: shogo82148/actions-setup-perl@66c3bf4d723291e6e93e621800f8364199de0563 # v1
+        with:
+          perl-version: ${{ matrix.perl }}
+      - name: Build quiche
+        run: |
+          sh tools/build-quiche.sh
+          echo "PKG_CONFIG_PATH=$PWD/.deps/quiche/target/release" >> "$GITHUB_ENV"
+      - name: Install Perl dependencies
+        run: cpanm --installdeps --with-recommends .
+      - name: Install HTTP/3 curl
+        if: runner.os == 'macOS'
+        run: |
+          brew install curl
+          echo "NET_QUICHE_CURL=$(brew --prefix curl)/bin/curl" >> "$GITHUB_ENV"
+          "$(brew --prefix curl)/bin/curl" --version | grep -E '^Features:.*HTTP3'
+      - name: Test
+        run: |
+          perl Build.PL
+          ./Build
+          ./Build test
+
+  distribution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: shogo82148/actions-setup-perl@66c3bf4d723291e6e93e621800f8364199de0563 # v1
+        with:
+          perl-version: '5.40'
+      - name: Build quiche
+        run: |
+          sh tools/build-quiche.sh
+          echo "PKG_CONFIG_PATH=$PWD/.deps/quiche/target/release" >> "$GITHUB_ENV"
+      - name: Install author dependencies
+        run: cpanm --installdeps --with-develop --with-recommends .
+      - name: Test source distribution
+        run: minil dist
