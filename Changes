@@ -4,6 +4,13 @@ Revision history for Net-Quiche
     - Prepare the existing 0.013 implementation for its first public release.
     - Manage dependencies, metadata and distribution archives with Minilla.
     - Include TLS test fixtures so native HTTP/3 tests run from a source archive.
+    - Fix resource leaks and stuck streams found in review: a rejected first
+      packet no longer holds a server connection slot, request bodies are read
+      at the application's pace, streams the application abandons are reset
+      or stopped, http3() no longer creates a second HTTP/3 session, and the
+      client no longer leaks buffered responses or hangs on retries.
+    - timeout_ms() returns undef when quiche has no timer armed.
+    - New: poll(read_body => 0), recv_body() and max_request_body_buffer.
 
     The implementation includes the quiche C API binding, Perl-owned QUIC and
     HTTP/3 objects, an IO::Async HTTP/3 client, and a PAGI UDP listener with

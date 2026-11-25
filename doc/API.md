@@ -259,7 +259,10 @@ socket per origin. Plain `http://` and `https://` proxy URIs are rejected
 because their ordinary CONNECT tunnel carries TCP, not QUIC datagrams.
 
 `get`, `post`, and `request` buffer a response up to `max_response_body`,
-which defaults to 16 MiB. `start_request` exposes request and response
+which defaults to 16 MiB. When a response goes over that limit, the request
+fails and its stream is cancelled, so the rest of the body is not downloaded.
+If the server answers early and sends STOP_SENDING, the upload stops and the
+request still resolves with that response. `start_request` exposes request and response
 backpressure directly:
 
 ```perl
@@ -283,13 +286,21 @@ At any point, the owner can call
 `$exchange->cancel if $upload_is_no_longer_needed`. It is idempotent and
 returns true only when it cancels an active exchange.
 
-Only one `write` and one response `read` may be pending per exchange. Request
+Only one `write` and one response `read` may be pending per exchange. A
+cancelled `read` no longer counts as pending, and the next chunk stays queued
+for the following `read`. Request
 body scalars remain owned by the exchange until quiche accepts them. Response
 DATA is copied into Perl byte strings and retained until `read` consumes it.
 `response_buffer_limit` bounds unread DATA across one origin and defaults to
 1 MiB. HTTPS is mandatory and peer verification is controlled by the supplied
 quiche config. SOCKS5 authentication, UDP fragmentation, MASQUE CONNECT-UDP,
 0-RTT, response trailers, and connection migration are not implemented.
+Interim 1xx responses such as 103 Early Hints are skipped, and the final
+response is returned. Response trailers are received and ignored. A malformed
+response header block fails only its own request. `stop`, and any failure that
+ends a connection, sends CONNECTION_CLOSE with H3_NO_ERROR so the server can
+free its state at once. A retry started from a failure callback opens a new
+connection.
 DNS currently uses a synchronous `getaddrinfo` call when an origin is first
 opened; UDP and QUIC processing remain asynchronous after resolution. A request
 deadline is armed before lookup, but cannot interrupt `getaddrinfo` while that

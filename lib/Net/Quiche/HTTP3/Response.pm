@@ -84,10 +84,16 @@ sub read {
     }
     return Future->fail($self->{failure}) if defined $self->{failure};
     return Future->done(undef) if $self->{complete};
-    return Future->fail('Only one pending read() is allowed per HTTP/3 response')
-        if $self->{waiter};
-    my $waiter = $self->{waiter} = Future->new;
-    return $waiter->without_cancel;
+    if (my $pending = $self->{waiter}) {
+        return Future->fail(
+            'Only one pending read() is allowed per HTTP/3 response')
+            unless $pending->is_ready;
+        # The caller cancelled its earlier read().
+        delete $self->{waiter};
+    }
+    # Cancelling this Future only abandons the read; the next chunk stays
+    # queued for a later read().
+    return $self->{waiter} = Future->new;
 }
 
 sub slurp {
@@ -109,6 +115,8 @@ sub slurp {
 
     my $body = '';
     my $read;
+    # $read refers to itself to loop. Break that cycle once the loop ends,
+    # or every slurped response and its body would be kept alive.
     $read = sub {
         return $self->read->then(sub {
             my ($chunk) = @_;
@@ -125,7 +133,7 @@ sub slurp {
             return Future->done($body);
         });
     };
-    return $read->();
+    return $read->()->on_ready(sub { undef $read });
 }
 
 sub body {
@@ -142,9 +150,10 @@ sub _push_body {
         $self->{on_consume}->(length $body);
         return;
     }
-    if (my $waiter = delete $self->{waiter}) {
+    my $waiter = delete $self->{waiter};
+    if ($waiter && !$waiter->is_ready) {
         $self->{on_consume}->(length $body);
-        $waiter->done($body) unless $waiter->is_ready;
+        $waiter->done($body);
     } else {
         push @{$self->{queue}}, $body;
     }
