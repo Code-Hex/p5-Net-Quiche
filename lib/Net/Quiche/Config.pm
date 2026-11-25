@@ -249,7 +249,15 @@ sub _path {
     croak "$name path must be a defined scalar"
         if !defined($path) || ref($path);
     croak "$name path must not contain NUL" if index($path, "\0") >= 0;
-    return "$path";
+    # Paths reach quiche as bytes, as with Perl's own open(), and quiche
+    # only accepts UTF-8. A path with wide characters has no single byte
+    # form, so ask for an encoded one.
+    my $bytes = "$path";
+    croak "$name path must be a byte string; encode it as UTF-8 first"
+        unless utf8::downgrade($bytes, 1);
+    croak "$name path must be UTF-8 encoded bytes"
+        unless utf8::decode(my $check = $bytes);
+    return $bytes;
 }
 
 sub _directory_path {
@@ -326,6 +334,11 @@ exceptions. Setter methods return the config object for chaining.
 =item * C<verify_locations_file>, C<load_verify_locations_from_file>
 
 =item * C<verify_locations_directory>, C<load_verify_locations_from_directory>
+
+Paths are passed to quiche as bytes, the same way Perl's C<open> treats a
+byte string. quiche only accepts UTF-8 paths, so encode a path that contains
+wide characters with C<Encode::encode('UTF-8', ...)> first. Other byte
+sequences are refused rather than reinterpreted.
 
 =item * C<application_protocols>
 

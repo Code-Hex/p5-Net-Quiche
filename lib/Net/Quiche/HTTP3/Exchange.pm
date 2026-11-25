@@ -27,6 +27,7 @@ sub _new {
         request_finished   => 0,
         response_finished  => 0,
         finish_future      => undef,
+        request_stopped    => 0,
         response_future    => Future->new,
         response           => undef,
         failure            => undef,
@@ -38,6 +39,8 @@ sub write {
     my ($self, $body) = @_;
     $body = _bytes('request body', $body);
     return Future->fail($self->{failure}) if defined $self->{failure};
+    # The server no longer wants the body; there is nothing left to send.
+    return Future->done if $self->{request_stopped};
     return Future->fail('HTTP/3 exchange is no longer active')
         unless $self->{client};
     return Future->fail('request body is already complete')
@@ -61,6 +64,7 @@ sub finish_request {
     croak 'finish_request() takes no arguments' unless @_ == 1;
     my ($self) = @_;
     return Future->fail($self->{failure}) if defined $self->{failure};
+    return Future->done if $self->{request_stopped};
     return Future->fail('HTTP/3 exchange is no longer active')
         unless $self->{client};
     return Future->fail('request body is already complete')
@@ -123,6 +127,22 @@ sub _write_complete {
         $self->{request_finished} = 1;
     }
     $operation->{future}->done unless $operation->{future}->is_ready;
+    return;
+}
+
+# The server sent STOP_SENDING. Settle every pending write as done: the
+# upload has ended on the server's terms, and the response can still arrive.
+sub _request_stopped {
+    my ($self) = @_;
+    return if $self->{request_stopped} || defined $self->{failure};
+    $self->{request_stopped} = 1;
+    $self->{request_finished} = 1;
+    $self->{finish_requested} = 1;
+    for my $operation (splice @{$self->{writes}}) {
+        $operation->{future}->done unless $operation->{future}->is_ready;
+    }
+    $self->{finish_future}->done
+        if $self->{finish_future} && !$self->{finish_future}->is_ready;
     return;
 }
 

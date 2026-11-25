@@ -92,7 +92,7 @@ while (my $datagram = $connection->next_datagram) {
 }
 
 my $milliseconds = $connection->timeout_ms;
-# When that timer expires:
+# undef means quiche has no timer armed. Otherwise, when it expires:
 $connection->on_timeout;
 ```
 
@@ -140,7 +140,22 @@ Every event carries a `stream_id`. Headers remain an ordered array of pairs,
 so duplicates such as `set-cookie` are not collapsed. Body reads are bounded
 chunks rather than an unbounded allocation. Writes return the accepted byte
 count; a temporarily blocked write returns `undef` and can be retried after
-transport progress.
+transport progress. If the peer resets a stream while its body is being read,
+`poll` returns `{ type => "reset", stream_id => $id }` for that stream and
+keeps working for the others.
+
+By default `poll` reads each `data` event's body for you. Pass
+`read_body => 0` to get `{ type => "data", stream_id => $id }` without a
+body, then call `$h3->recv_body($stream_id, $max_bytes)` until it returns
+`undef`. Data that has not been read stays in quiche and holds back the
+peer's flow-control window, which lets a server apply backpressure to a
+request body. quiche does not report `data` again for a stream until its
+buffered body has been read to the end, and a `finished` event only follows
+once the body has been read.
+
+Calling `$connection->http3` again after dropping the returned object gives a
+new wrapper around the same HTTP/3 session. Error codes passed to `close` and
+`shutdown_stream` must fit in a QUIC varint (at most 2^62-1).
 
 GOAWAY events use `{ type => "goaway", id => $cutoff }` because the cutoff
 belongs to the connection rather than one request stream. `send_goaway`
@@ -244,7 +259,10 @@ socket per origin. Plain `http://` and `https://` proxy URIs are rejected
 because their ordinary CONNECT tunnel carries TCP, not QUIC datagrams.
 
 `get`, `post`, and `request` buffer a response up to `max_response_body`,
-which defaults to 16 MiB. `start_request` exposes request and response
+which defaults to 16 MiB. When a response goes over that limit, the request
+fails and its stream is cancelled, so the rest of the body is not downloaded.
+If the server answers early and sends STOP_SENDING, the upload stops and the
+request still resolves with that response. `start_request` exposes request and response
 backpressure directly:
 
 ```perl
@@ -268,13 +286,21 @@ At any point, the owner can call
 `$exchange->cancel if $upload_is_no_longer_needed`. It is idempotent and
 returns true only when it cancels an active exchange.
 
-Only one `write` and one response `read` may be pending per exchange. Request
+Only one `write` and one response `read` may be pending per exchange. A
+cancelled `read` no longer counts as pending, and the next chunk stays queued
+for the following `read`. Request
 body scalars remain owned by the exchange until quiche accepts them. Response
 DATA is copied into Perl byte strings and retained until `read` consumes it.
 `response_buffer_limit` bounds unread DATA across one origin and defaults to
 1 MiB. HTTPS is mandatory and peer verification is controlled by the supplied
 quiche config. SOCKS5 authentication, UDP fragmentation, MASQUE CONNECT-UDP,
 0-RTT, response trailers, and connection migration are not implemented.
+Interim 1xx responses such as 103 Early Hints are skipped, and the final
+response is returned. Response trailers are received and ignored. A malformed
+response header block fails only its own request. `stop`, and any failure that
+ends a connection, sends CONNECTION_CLOSE with H3_NO_ERROR so the server can
+free its state at once. A retry started from a failure callback opens a new
+connection.
 DNS currently uses a synchronous `getaddrinfo` call when an origin is first
 opened; UDP and QUIC processing remain asynchronous after resolution. A request
 deadline is armed before lookup, but cannot interrupt `getaddrinfo` while that
@@ -364,6 +390,26 @@ while (1) {
     last unless $event->{more};
 }
 ```
+
+The server reads a request body only as fast as the application receives it.
+Each request stream buffers at most `max_request_body_buffer` bytes of unread
+events (default 1 MiB, set it on `PAGI::Server::HTTP3->new`). Anything beyond
+that stays in quiche, and QUIC flow control holds the client back until the
+application calls `$receive` again. If the application finishes its response
+without reading the whole body, the server sends STOP_SENDING with
+H3_NO_ERROR so the client stops uploading. If the application fails or
+returns after `http.response.start` without completing the body, the server
+resets the response stream with H3_INTERNAL_ERROR so the client does not
+wait for its idle timeout.
+
+When a request has no `:authority`, its `host` header is passed to the
+application instead.
+
+The listener only creates a QUIC connection for an Initial packet in a
+datagram of at least 1200 bytes, and only answers Version Negotiation for
+such datagrams. A connection whose first packet quiche rejects (for example,
+a ClientHello without the `h3` ALPN) is released straight away, so it does not
+hold a `max_connections` slot.
 
 PAGI applications must await every `$send->(...)` Future. The Future resolves
 only after quiche accepts the complete event. When QUIC flow control accepts

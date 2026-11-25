@@ -14,6 +14,11 @@ die "Net::Quiche::XS requires released quiche >= 0.29.3; loaded $library_version
     unless $library_version =~ /\A[0-9]+\.[0-9]+\.[0-9]+\z/
         && version->parse($library_version) >= version->parse('0.29.3');
 
+# Native handles hold raw pointers. A cloned interpreter must not free them
+# a second time.
+sub Net::Quiche::XS::Connection::CLONE_SKIP { 1 }
+sub Net::Quiche::XS::HTTP3::CLONE_SKIP { 1 }
+
 1;
 
 __END__

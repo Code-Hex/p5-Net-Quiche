@@ -132,7 +132,7 @@ sub close {
     my $application = exists($options{application})
         ? _boolean('application', $options{application}) : 0;
     my $error_code = exists($options{error_code})
-        ? _nonnegative_integer('error_code', $options{error_code}) : 0;
+        ? _error_code($options{error_code}) : 0;
     my $reason = _bytes('reason', $options{reason} // '');
     Net::Quiche::XS::_connection_close(
         $self->{_native}, $application, $error_code, $reason,
@@ -152,7 +152,7 @@ sub shutdown_stream {
     croak "direction must be 'read' or 'write'"
         if !defined($direction) || ref($direction)
             || ($direction ne 'read' && $direction ne 'write');
-    my $error_code = _nonnegative_integer('error_code', $options{error_code});
+    my $error_code = _error_code($options{error_code});
     return !!Net::Quiche::XS::_connection_stream_shutdown(
         $self->{_native}, $stream_id, $direction eq 'read' ? 0 : 1,
         $error_code,
@@ -206,7 +206,14 @@ sub http3 {
         unless $self->is_established;
     return $self->{_http3} if $self->{_http3};
     require Net::Quiche::HTTP3;
-    my $http3 = Net::Quiche::HTTP3->_new(connection => $self);
+    # The native HTTP/3 session and its read state belong to the transport.
+    # Only the Perl wrapper is cached weakly, so dropping the wrapper and
+    # calling http3() again reuses the same session instead of opening a
+    # second set of control and QPACK streams on the connection.
+    my $session = $self->{_http3_session} ||= {};
+    my $http3 = Net::Quiche::HTTP3->_new(
+        connection => $self, session => $session,
+    );
     $self->{_http3} = $http3;
     weaken($self->{_http3});
     return $http3;
@@ -286,6 +293,18 @@ sub _nonnegative_integer {
     return 0 + $value;
 }
 
+sub _error_code {
+    my ($value) = @_;
+    # QUIC encodes error codes as varints. quiche panics, and so aborts the
+    # process, when asked to encode anything larger.
+    croak 'error_code must be an integer from 0 to 2^62-1'
+        if !defined($value) || ref($value)
+            || $value !~ /\A(?:0|[1-9][0-9]*)\z/
+            || length($value) > 19
+            || $value > 4_611_686_018_427_387_903;
+    return 0 + $value;
+}
+
 sub _boolean {
     my ($name, $value) = @_;
     croak "$name must be 0 or 1"
@@ -361,10 +380,18 @@ C<local_error> and C<peer_error> return copied error details when quiche has a
 close reason.
 
 C<shutdown_stream> accepts a stream ID plus C<direction> (C<read> or C<write>)
-and a non-negative application C<error_code>. It returns false when quiche no
+and an application C<error_code> from 0 to 2^62-1. It returns false when quiche no
 longer has work for that direction, and true when shutdown was applied.
 
 C<close> starts QUIC connection close and returns the connection. It accepts
 C<application>, C<error_code>, and a byte-string C<reason>; omitted values
-produce a transport-level NO_ERROR close. C<is_draining> reports quiche's
+produce a transport-level NO_ERROR close. C<error_code> must not exceed
+2^62-1, the largest value a QUIC varint can carry.
+
+C<timeout_ms> returns the number of milliseconds until C<on_timeout> must be
+called, or C<undef> when quiche has no timer armed.
+
+C<http3> returns the connection's HTTP/3 session. The native session lives as
+long as the connection, so calling C<http3> again after dropping the returned
+object reuses it. C<is_draining> reports quiche's
 draining state after either endpoint closes the connection.

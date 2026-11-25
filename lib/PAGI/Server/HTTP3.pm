@@ -27,6 +27,9 @@ use constant LOCAL_CONNECTION_ID_LENGTH => 16;
 use constant MAX_REQUEST_STREAM_ID => 4_611_686_018_427_387_900;
 use constant H3_NO_ERROR => 0x100;
 use constant DEFAULT_SHUTDOWN_GRACE => 5;
+# RFC 9000 section 14.1: a client's first Initial fills at least 1200 bytes.
+use constant MIN_INITIAL_DATAGRAM_SIZE => 1_200;
+use constant PACKET_TYPE_INITIAL => 1;
 
 sub _init {
     my ($self, $params) = @_;
@@ -49,6 +52,7 @@ sub _init {
     $self->{port} = delete($params->{port}) // 8443;
     $self->{max_connections} = delete($params->{max_connections}) // 1_000;
     $self->{on_error} = delete($params->{on_error}) || sub { warn "$_[0]\n" };
+    $self->{max_request_body_buffer} = delete $params->{max_request_body_buffer};
 
     croak 'app must be a PAGI code reference' unless ref($self->{app}) eq 'CODE';
     croak 'config must be a Net::Quiche::Config object'
@@ -65,6 +69,10 @@ sub _init {
         unless defined($self->{max_connections}) && !ref($self->{max_connections})
             && $self->{max_connections} =~ /\A[1-9][0-9]*\z/;
     croak 'on_error must be a code reference' unless ref($self->{on_error}) eq 'CODE';
+    croak 'max_request_body_buffer must be a positive integer'
+        if defined($self->{max_request_body_buffer})
+            && (ref($self->{max_request_body_buffer})
+                || $self->{max_request_body_buffer} !~ /\A[1-9][0-9]*\z/);
 
     $self->{socket} = undef;
     $self->{listen_future} = undef;
@@ -98,7 +106,11 @@ sub listen {
         on_recv => sub {
             my (undef, $data, $peer_address) = @_;
             return unless $weak_self;
-            $weak_self->_receive_datagram($data, $peer_address);
+            # An exception here would escape into the event loop and stop
+            # every connection, so report it and keep serving.
+            eval { $weak_self->_receive_datagram($data, $peer_address); 1 }
+                or $weak_self->_report_error(
+                    $@ || 'HTTP/3 datagram handling failed');
         },
         on_recv_error => sub {
             return unless $weak_self;
@@ -254,8 +266,13 @@ sub _receive_datagram {
         length($data), $header->{version}, $header->{type}, unpack('H*', $destination_id),
     ));
     my $state = $self->{routes}{$destination_id};
+    my $created = 0;
     if (!$state) {
         return if $self->{shutting_down};
+        # Only a full-size datagram may make the server answer or allocate
+        # state. Smaller ones are not a client's first flight, and replying
+        # to them would let spoofed packets use the server as a reflector.
+        return if length($data) < MIN_INITIAL_DATAGRAM_SIZE;
         if (!Net::Quiche::Packet->version_is_supported($header->{version})) {
             return if $header->{version} == 0;
             my $negotiation = eval {
@@ -277,6 +294,9 @@ sub _receive_datagram {
             ));
             return;
         }
+        # Handshake, 0-RTT and short-header packets for an unknown
+        # connection are stale or forged; only an Initial can start one.
+        return unless $header->{type} == PACKET_TYPE_INITIAL;
         if ($self->connection_count >= $self->{max_connections}) {
             $self->_report_error('HTTP/3 connection limit reached');
             return;
@@ -287,6 +307,7 @@ sub _receive_datagram {
             return;
         }
         $self->_debug('created connection scid=' . unpack('H*', $state->{id}));
+        $created = 1;
     }
 
     my $peer = _unpack_address($peer_packed);
@@ -300,6 +321,14 @@ sub _receive_datagram {
     };
     if (!$received) {
         $self->_report_error($@ || 'Failed to receive QUIC datagram');
+        # quiche has usually queued a CONNECTION_CLOSE. Send it, and let the
+        # timer or the closed state release the connection.
+        $self->_flush_state($state);
+        # A connection that failed on its first packet never got going.
+        # Release its slot now so bad Initials cannot fill max_connections.
+        $self->_drop_connection($state)
+            if $created && $self->{connections}{$state->{id}}
+                && !$state->{connection}->is_established;
         return;
     }
 
@@ -313,6 +342,9 @@ sub _receive_datagram {
             connection => $state->{connection},
             client => $state->{peer},
             server => [$self->{host}, $self->{bound_port}],
+            (defined($self->{max_request_body_buffer})
+                ? (max_request_body_buffer => $self->{max_request_body_buffer})
+                : ()),
             on_write => sub {
                 $weak_self->_flush_by_id($id) if $weak_self;
             },
@@ -371,7 +403,10 @@ sub _create_connection {
     my $timer = IO::Async::Timer::Countdown->new(
         delay => 0,
         on_expire => sub {
-            $weak_self->_on_timeout($source_id) if $weak_self;
+            return unless $weak_self;
+            eval { $weak_self->_on_timeout($source_id); 1 }
+                or $weak_self->_report_error(
+                    $@ || 'HTTP/3 timer handling failed');
         },
     );
     $state->{timer} = $timer;
@@ -598,6 +633,7 @@ sub _arm_timer {
     my $timer = $state->{timer};
     $timer->stop if $timer->is_running;
     my $milliseconds = $state->{connection}->timeout_ms;
+    return unless defined $milliseconds;
     $timer->configure(delay => $milliseconds / 1_000);
     $timer->start;
 }
@@ -735,7 +771,14 @@ request streams can finish and clients can open replacement connections.
 C<shutdown> refuses new connections, sends initial and final GOAWAY frames,
 waits up to C<grace> seconds for active PAGI streams, closes with H3_NO_ERROR,
 and then closes the UDP listener. It returns a cancellation-isolated Future.
-C<stop> remains immediate. Pass C<psgi_app> instead of C<app> to lazily wrap a
+C<stop> remains immediate.
+
+C<max_request_body_buffer> limits how many bytes of unread request body each
+request stream keeps in Perl (default 1 MiB). The rest stays in quiche under
+QUIC flow control until the application calls C<receive> again. Only an
+Initial packet in a datagram of at least 1200 bytes can create a connection,
+and a connection whose first packet quiche rejects is released at once.
+Pass C<psgi_app> instead of C<app> to lazily wrap a
 PSGI application with C<PAGI::App::WrapPSGI>; the two options are mutually
 exclusive. Retry, migration, and trailers remain outside the current MVP. The
 HTTP/3-specific conformance subset in

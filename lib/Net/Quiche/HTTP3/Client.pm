@@ -26,6 +26,7 @@ use Net::Quiche::HTTP3::Response ();
 our $VERSION = '0.013';
 
 use constant LOCAL_CONNECTION_ID_LENGTH => 16;
+use constant H3_NO_ERROR => 0x100;
 use constant H3_REQUEST_CANCELLED => 0x10c;
 
 sub _init {
@@ -168,7 +169,11 @@ sub _request_redirects {
             max_bytes => $self->{max_response_body},
         )->then_done($response);
     });
-    return Future->needs_all($sent, $received)->then(sub {
+    # When either side fails (for example the body exceeds
+    # max_response_body), stop the stream instead of downloading the rest.
+    return Future->needs_all($sent, $received)->on_fail(sub {
+        $exchange->cancel;
+    })->then(sub {
         my @results = @_;
         my $response = $results[-1];
         $response->_set_effective_uri($request->{uri});
@@ -251,7 +256,7 @@ sub _start_request {
         $options->{method}, $options->{uri}, $options->{headers} // []);
 
     my $state = $self->{origins}{$request->{origin_key}};
-    if (!$state) {
+    if (!$state || $state->{status} eq 'failed') {
         $state = $self->{origins}{$request->{origin_key}}
             = $self->_new_origin($request);
     }
@@ -662,9 +667,20 @@ sub _drain_request_writes {
         my $exchange = $state->{exchanges}{$stream_id};
         while (my $operation = $exchange->_next_write) {
             my $remaining = substr($operation->{body}, $operation->{offset});
-            my $written = $h3->send_body(
-                $stream_id, $remaining, final => $operation->{final},
-            );
+            my $written = eval {
+                $h3->send_body(
+                    $stream_id, $remaining, final => $operation->{final},
+                );
+            };
+            if (my $error = $@) {
+                die $error unless Net::Quiche::HTTP3::_is_stream_error($error);
+                # The server sent STOP_SENDING, usually after an early
+                # response (RFC 9114 section 4.1). The upload is over, but
+                # the response is still valid and the connection is fine.
+                $exchange->_request_stopped;
+                $self->_cleanup_exchange($state, $exchange);
+                last;
+            }
             last unless defined $written;
             croak 'quiche accepted more request bytes than supplied'
                 if $written > length($remaining);
@@ -709,28 +725,36 @@ sub _response_headers {
     my $stream_id = $event->{stream_id};
     my $exchange = $state->{exchanges}{$stream_id}
         or croak "response headers arrived for unknown stream $stream_id";
-    if ($exchange->{response}) {
-        $self->_fail_exchange(
-            $state, $exchange, 'HTTP/3 response trailers are not supported');
-        return;
-    }
-    my ($status, @headers);
+    # A second HEADERS frame after the final response carries trailers.
+    # They are not exposed yet, so skip them rather than failing the
+    # request, which already has its status and body.
+    return if $exchange->{response};
+    my ($status, @headers, $error);
     for my $header (@{$event->{headers}}) {
         my ($name, $value) = @{$header};
         if ($name eq ':status') {
-            croak "duplicate :status on HTTP/3 stream $stream_id"
+            $error = "duplicate :status on HTTP/3 stream $stream_id"
                 if defined $status;
-            croak "invalid :status on HTTP/3 stream $stream_id"
+            $error = "invalid :status on HTTP/3 stream $stream_id"
                 unless $value =~ /\A[1-5][0-9]{2}\z/;
-            $status = 0 + $value;
+            $status = 0 + $value if $value =~ /\A[0-9]+\z/;
+        } elsif (substr($name, 0, 1) eq ':') {
+            $error = "unexpected response pseudo-header '$name'";
         } else {
-            croak "unexpected response pseudo-header '$name'"
-                if substr($name, 0, 1) eq ':';
             push @headers, [$name, $value];
         }
+        last if defined $error;
     }
-    croak "missing :status on HTTP/3 stream $stream_id"
-        unless defined $status;
+    $error = "missing :status on HTTP/3 stream $stream_id"
+        unless defined($error) || defined($status);
+    if (defined $error) {
+        # A malformed response is a problem with this stream only.
+        $self->_cancel_exchange($exchange, $error);
+        return;
+    }
+    # 1xx responses such as 100 Continue and 103 Early Hints are interim.
+    # The final response follows on the same stream.
+    return if $status < 200;
     my $weak_self = $self;
     weaken($weak_self);
     my $weak_state = $state;
@@ -752,8 +776,11 @@ sub _response_data {
     my $stream_id = $event->{stream_id};
     my $exchange = $state->{exchanges}{$stream_id}
         or croak "response body arrived for unknown stream $stream_id";
-    croak "response body arrived before headers on stream $stream_id"
-        unless $exchange->{response};
+    if (!$exchange->{response}) {
+        $self->_cancel_exchange($exchange,
+            "response body arrived before headers on stream $stream_id");
+        return;
+    }
     $state->{buffered_bytes} += length $event->{body};
     $exchange->{response}->_push_body($event->{body});
     return;
@@ -763,8 +790,11 @@ sub _response_finished {
     my ($self, $state, $stream_id) = @_;
     my $exchange = $state->{exchanges}{$stream_id}
         or croak "response FINISHED arrived for unknown stream $stream_id";
-    croak "response FINISHED arrived before headers on stream $stream_id"
-        unless $exchange->{response};
+    if (!$exchange->{response}) {
+        $self->_cancel_exchange($exchange,
+            "response FINISHED arrived before headers on stream $stream_id");
+        return;
+    }
     $exchange->{response}->_finish;
     $exchange->_response_finished;
     $self->_cleanup_exchange($state, $exchange);
@@ -831,6 +861,15 @@ sub _fail_origin {
     my ($self, $state, $error) = @_;
     return if $state->{status} eq 'failed';
     $state->{status} = 'failed';
+    # Unregister before failing any Future, so a retry started from a
+    # failure callback opens a new connection instead of joining this one.
+    delete $self->{origins}{$state->{key}}
+        if $self->{origins}{$state->{key}}
+            && $self->{origins}{$state->{key}} == $state;
+    delete $self->{retired_origins}{$state->{id}}
+        if $self->{retired_origins}{$state->{id}}
+            && $self->{retired_origins}{$state->{id}} == $state;
+    $self->_close_connection($state);
     $self->_fail_pending($state, $error);
     for my $exchange (values %{$state->{exchanges}}) {
         next unless $exchange;
@@ -840,7 +879,7 @@ sub _fail_origin {
     }
     $state->{exchanges} = {};
     if (my $timer = delete $state->{timer}) {
-        $timer->stop if $timer->is_running;
+        $timer->stop if $timer->is_running && $timer->loop;
         $self->remove_child($timer) if $timer->parent;
     }
     if (my $socket = delete $state->{socket}) {
@@ -853,12 +892,29 @@ sub _fail_origin {
     }
     delete $state->{h3};
     delete $state->{connection};
-    delete $self->{origins}{$state->{key}}
-        if $self->{origins}{$state->{key}}
-            && $self->{origins}{$state->{key}} == $state;
-    delete $self->{retired_origins}{$state->{id}}
-        if $self->{retired_origins}{$state->{id}}
-            && $self->{retired_origins}{$state->{id}} == $state;
+    return;
+}
+
+# Tell the server the connection is going away, so it can free its state
+# now instead of waiting for the idle timeout.
+sub _close_connection {
+    my ($self, $state) = @_;
+    my $connection = $state->{connection} or return;
+    my $socket = $state->{socket} or return;
+    eval {
+        return 1 if $connection->is_closed;
+        $connection->close(
+            application => 1, error_code => H3_NO_ERROR, reason => '',
+        );
+        while (my $datagram = $connection->next_datagram) {
+            my $data = $state->{proxy}
+                ? $state->{proxy}->wrap_datagram(
+                    $state->{proxy_target}, $datagram->{data})
+                : $datagram->{data};
+            $socket->send($data);
+        }
+        1;
+    };
     return;
 }
 
@@ -923,7 +979,7 @@ sub _arm_exchange_timeout {
 sub _disarm_exchange_timeout {
     my ($self, $exchange) = @_;
     my $timer = delete $exchange->{timeout_timer} or return;
-    $timer->stop if $timer->is_running;
+    $timer->stop if $timer->is_running && $timer->loop;
     $self->remove_child($timer) if $timer->parent;
     return;
 }
@@ -970,8 +1026,9 @@ sub _cancel_exchange {
 sub _arm_timer {
     my ($self, $state) = @_;
     my $timer = $state->{timer} or return;
-    $timer->stop if $timer->is_running;
+    $timer->stop if $timer->is_running && $timer->loop;
     my $milliseconds = $state->{connection}->timeout_ms;
+    return unless defined $milliseconds;
     $timer->configure(delay => $milliseconds / 1_000);
     $timer->start;
     return;
