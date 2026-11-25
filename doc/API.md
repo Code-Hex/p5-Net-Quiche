@@ -380,6 +380,26 @@ while (1) {
 }
 ```
 
+The server reads a request body only as fast as the application receives it.
+Each request stream buffers at most `max_request_body_buffer` bytes of unread
+events (default 1 MiB, set it on `PAGI::Server::HTTP3->new`). Anything beyond
+that stays in quiche, and QUIC flow control holds the client back until the
+application calls `$receive` again. If the application finishes its response
+without reading the whole body, the server sends STOP_SENDING with
+H3_NO_ERROR so the client stops uploading. If the application fails or
+returns after `http.response.start` without completing the body, the server
+resets the response stream with H3_INTERNAL_ERROR so the client does not
+wait for its idle timeout.
+
+When a request has no `:authority`, its `host` header is passed to the
+application instead.
+
+The listener only creates a QUIC connection for an Initial packet in a
+datagram of at least 1200 bytes, and only answers Version Negotiation for
+such datagrams. A connection whose first packet quiche rejects (for example,
+a ClientHello without the `h3` ALPN) is released straight away, so it does not
+hold a `max_connections` slot.
+
 PAGI applications must await every `$send->(...)` Future. The Future resolves
 only after quiche accepts the complete event. When QUIC flow control accepts
 only part of a response body, the protocol keeps the unsent suffix and retries
