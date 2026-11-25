@@ -214,11 +214,16 @@ sub _resume_request_body {
     my ($self, $stream_id) = @_;
     my $stream = $self->{streams}{$stream_id} or return;
     return unless $stream->{body_paused};
-    $self->_read_request_body($stream_id);
-    # A finished event, if any, only follows once the body has been read.
-    $self->drain_events;
-    # Reading returned flow-control credit, which must reach the client.
-    $self->{on_write}->();
+    # This runs inside the application's receive(). Report failures here
+    # rather than turning them into an exception in application code.
+    eval {
+        $self->_read_request_body($stream_id);
+        # A finished event, if any, only follows once the body has been read.
+        $self->drain_events;
+        # Reading returned flow-control credit, which must reach the client.
+        $self->{on_write}->();
+        1;
+    } or $self->_report_error($@ || 'HTTP/3 request body read failed');
     return;
 }
 
