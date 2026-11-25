@@ -92,7 +92,7 @@ while (my $datagram = $connection->next_datagram) {
 }
 
 my $milliseconds = $connection->timeout_ms;
-# When that timer expires:
+# undef means quiche has no timer armed. Otherwise, when it expires:
 $connection->on_timeout;
 ```
 
@@ -140,7 +140,22 @@ Every event carries a `stream_id`. Headers remain an ordered array of pairs,
 so duplicates such as `set-cookie` are not collapsed. Body reads are bounded
 chunks rather than an unbounded allocation. Writes return the accepted byte
 count; a temporarily blocked write returns `undef` and can be retried after
-transport progress.
+transport progress. If the peer resets a stream while its body is being read,
+`poll` returns `{ type => "reset", stream_id => $id }` for that stream and
+keeps working for the others.
+
+By default `poll` reads each `data` event's body for you. Pass
+`read_body => 0` to get `{ type => "data", stream_id => $id }` without a
+body, then call `$h3->recv_body($stream_id, $max_bytes)` until it returns
+`undef`. Data that has not been read stays in quiche and holds back the
+peer's flow-control window, which lets a server apply backpressure to a
+request body. quiche does not report `data` again for a stream until its
+buffered body has been read to the end, and a `finished` event only follows
+once the body has been read.
+
+Calling `$connection->http3` again after dropping the returned object gives a
+new wrapper around the same HTTP/3 session. Error codes passed to `close` and
+`shutdown_stream` must fit in a QUIC varint (at most 2^62-1).
 
 GOAWAY events use `{ type => "goaway", id => $cutoff }` because the cutoff
 belongs to the connection rather than one request stream. `send_goaway`

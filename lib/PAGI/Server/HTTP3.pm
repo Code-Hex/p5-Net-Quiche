@@ -598,6 +598,7 @@ sub _arm_timer {
     my $timer = $state->{timer};
     $timer->stop if $timer->is_running;
     my $milliseconds = $state->{connection}->timeout_ms;
+    return unless defined $milliseconds;
     $timer->configure(delay => $milliseconds / 1_000);
     $timer->start;
 }

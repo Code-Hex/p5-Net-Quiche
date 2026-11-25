@@ -3,6 +3,7 @@
 #include "XSUB.h"
 #include <quiche.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 #define NET_QUICHE_MAX_DATAGRAM_SIZE 1350
 
@@ -106,13 +107,39 @@ net_quiche_sockaddr_from_sv(pTHX_ SV *packed, struct sockaddr_storage *out,
 {
     STRLEN length;
     const char *bytes = SvPVbyte(packed, length);
+    sa_family_t family;
 
-    if (length == 0 || length > sizeof(*out)) {
+    if (length < sizeof(struct sockaddr_in) || length > sizeof(*out)) {
         croak("Invalid packed %s socket address", name);
     }
     Zero(out, 1, struct sockaddr_storage);
     Copy(bytes, out, length, char);
+    /* quiche asserts on the family and exact length, and an assertion
+     * failure inside the C API aborts the whole process. */
+    family = ((struct sockaddr *) out)->sa_family;
+    if (!((family == AF_INET && length == sizeof(struct sockaddr_in)) ||
+            (family == AF_INET6 && length == sizeof(struct sockaddr_in6)))) {
+        croak("Invalid packed %s socket address", name);
+    }
     *out_len = (socklen_t) length;
+}
+
+/* quiche's file loaders unwrap the path as UTF-8 and panic otherwise, which
+ * aborts the process from inside the C API. Pass the caller's bytes
+ * unchanged, but refuse anything quiche cannot read. */
+static const char *
+net_quiche_path_from_sv(pTHX_ SV *path)
+{
+    STRLEN length;
+    const char *bytes = SvPVbyte(path, length);
+
+    if (memchr(bytes, '\0', length) != NULL) {
+        croak("Path must not contain NUL");
+    }
+    if (!is_utf8_string((const U8 *) bytes, length)) {
+        croak("quiche requires a UTF-8 encoded path");
+    }
+    return bytes;
 }
 
 static quiche_h3_header *
@@ -127,6 +154,8 @@ net_quiche_headers_from_av(pTHX_ AV *input, size_t *count)
         return NULL;
     }
     Newxz(headers, *count, quiche_h3_header);
+    /* Callers run inside ENTER/LEAVE; a croak below unwinds this too. */
+    SAVEFREEPV(headers);
 
     for (i = 0; i <= last; i++) {
         SV **item = av_fetch(input, i, 0);
@@ -138,14 +167,12 @@ net_quiche_headers_from_av(pTHX_ AV *input, size_t *count)
 
         if (item == NULL || !SvROK(*item) ||
                 SvTYPE(SvRV(*item)) != SVt_PVAV) {
-            Safefree(headers);
             croak("HTTP/3 headers must contain array references");
         }
         pair = (AV *) SvRV(*item);
         name = av_fetch(pair, 0, 0);
         value = av_fetch(pair, 1, 0);
         if (name == NULL || value == NULL || av_len(pair) != 1) {
-            Safefree(headers);
             croak("Each HTTP/3 header must contain exactly two values");
         }
         headers[i].name = (const uint8_t *) SvPVbyte(*name, name_len);
@@ -282,10 +309,9 @@ _config_load_cert_chain(config_object, path)
         SV *config_object
         SV *path
     PREINIT:
-        STRLEN path_len;
         const char *path_bytes;
     CODE:
-        path_bytes = SvPVutf8(path, path_len);
+        path_bytes = net_quiche_path_from_sv(aTHX_ path);
         RETVAL = quiche_config_load_cert_chain_from_pem_file(
             net_quiche_config_handle_from_sv(aTHX_ config_object)->config,
             path_bytes);
@@ -297,10 +323,9 @@ _config_load_private_key(config_object, path)
         SV *config_object
         SV *path
     PREINIT:
-        STRLEN path_len;
         const char *path_bytes;
     CODE:
-        path_bytes = SvPVutf8(path, path_len);
+        path_bytes = net_quiche_path_from_sv(aTHX_ path);
         RETVAL = quiche_config_load_priv_key_from_pem_file(
             net_quiche_config_handle_from_sv(aTHX_ config_object)->config,
             path_bytes);
@@ -312,10 +337,9 @@ _config_load_verify_locations_from_file(config_object, path)
         SV *config_object
         SV *path
     PREINIT:
-        STRLEN path_len;
         const char *path_bytes;
     CODE:
-        path_bytes = SvPVutf8(path, path_len);
+        path_bytes = net_quiche_path_from_sv(aTHX_ path);
         RETVAL = quiche_config_load_verify_locations_from_file(
             net_quiche_config_handle_from_sv(aTHX_ config_object)->config,
             path_bytes);
@@ -327,10 +351,9 @@ _config_load_verify_locations_from_directory(config_object, path)
         SV *config_object
         SV *path
     PREINIT:
-        STRLEN path_len;
         const char *path_bytes;
     CODE:
-        path_bytes = SvPVutf8(path, path_len);
+        path_bytes = net_quiche_path_from_sv(aTHX_ path);
         RETVAL = quiche_config_load_verify_locations_from_directory(
             net_quiche_config_handle_from_sv(aTHX_ config_object)->config,
             path_bytes);
@@ -547,22 +570,24 @@ _connection_receive(native_connection, packet, from_address, to_address)
         socklen_t from_len;
         socklen_t to_len;
         quiche_recv_info info;
+        quiche_conn *conn;
         ssize_t result;
     CODE:
+        /* Everything that can croak runs before the copy is allocated. */
+        conn = net_quiche_connection_handle_from_sv(
+            aTHX_ native_connection)->conn;
+        net_quiche_sockaddr_from_sv(aTHX_ from_address, &from, &from_len, "from");
+        net_quiche_sockaddr_from_sv(aTHX_ to_address, &to, &to_len, "to");
         packet_bytes = (const uint8_t *) SvPVbyte(packet, packet_len);
         Newx(mutable_packet, packet_len ? packet_len : 1, uint8_t);
         if (packet_len) {
             Copy(packet_bytes, mutable_packet, packet_len, uint8_t);
         }
-        net_quiche_sockaddr_from_sv(aTHX_ from_address, &from, &from_len, "from");
-        net_quiche_sockaddr_from_sv(aTHX_ to_address, &to, &to_len, "to");
         info.from = (struct sockaddr *) &from;
         info.from_len = from_len;
         info.to = (struct sockaddr *) &to;
         info.to_len = to_len;
-        result = quiche_conn_recv(
-            net_quiche_connection_handle_from_sv(aTHX_ native_connection)->conn,
-            mutable_packet, packet_len, &info);
+        result = quiche_conn_recv(conn, mutable_packet, packet_len, &info);
         Safefree(mutable_packet);
         if (result < 0) {
             croak("quiche_conn_recv() failed: %ld", (long) result);
@@ -607,12 +632,22 @@ _connection_next_datagram(native_connection)
     OUTPUT:
         RETVAL
 
-UV
+SV *
 _connection_timeout_ms(native_connection)
         SV *native_connection
+    PREINIT:
+        uint64_t timeout;
     CODE:
-        RETVAL = (UV) quiche_conn_timeout_as_millis(
+        timeout = quiche_conn_timeout_as_millis(
             net_quiche_connection_handle_from_sv(aTHX_ native_connection)->conn);
+        /* quiche reports "no timer is armed" as UINT64_MAX. */
+        if (timeout == UINT64_MAX) {
+            XSRETURN_UNDEF;
+        }
+        RETVAL = newSVnv((NV) timeout);
+        if ((uint64_t) (UV) timeout == timeout) {
+            sv_setuv(RETVAL, (UV) timeout);
+        }
     OUTPUT:
         RETVAL
 
@@ -780,16 +815,17 @@ _h3_new(native_connection)
         SV *native_connection
     PREINIT:
         quiche_h3_config *config;
+        quiche_conn *transport;
         quiche_h3_conn *conn;
         net_quiche_h3_handle *handle;
     CODE:
+        transport = net_quiche_connection_handle_from_sv(
+            aTHX_ native_connection)->conn;
         config = quiche_h3_config_new();
         if (config == NULL) {
             croak("quiche_h3_config_new() failed");
         }
-        conn = quiche_h3_conn_new_with_transport(
-            net_quiche_connection_handle_from_sv(aTHX_ native_connection)->conn,
-            config);
+        conn = quiche_h3_conn_new_with_transport(transport, config);
         quiche_h3_config_free(config);
         if (conn == NULL) {
             croak("quiche_h3_conn_new_with_transport() failed");
@@ -853,27 +889,34 @@ _h3_receive_body(native_h3, native_connection, stream_id, capacity)
         UV stream_id
         UV capacity
     PREINIT:
-        uint8_t *buffer;
+        quiche_h3_conn *h3;
+        quiche_conn *conn;
+        char *buffer;
         ssize_t result;
     CODE:
         if (capacity == 0) {
             croak("HTTP/3 body read capacity must be greater than zero");
         }
-        Newx(buffer, capacity, uint8_t);
+        h3 = net_quiche_h3_handle_from_sv(aTHX_ native_h3)->conn;
+        conn = net_quiche_connection_handle_from_sv(
+            aTHX_ native_connection)->conn;
+        /* Read straight into the returned scalar; it is mortal until the
+         * read succeeds, so a croak cannot leak it. */
+        RETVAL = sv_2mortal(newSV(capacity));
+        SvPOK_only(RETVAL);
+        buffer = SvPVX(RETVAL);
         result = quiche_h3_recv_body(
-            net_quiche_h3_handle_from_sv(aTHX_ native_h3)->conn,
-            net_quiche_connection_handle_from_sv(aTHX_ native_connection)->conn,
-            (uint64_t) stream_id, buffer, (size_t) capacity);
+            h3, conn, (uint64_t) stream_id, (uint8_t *) buffer,
+            (size_t) capacity);
         if (result == QUICHE_H3_ERR_DONE) {
-            Safefree(buffer);
             XSRETURN_UNDEF;
         }
         if (result < 0) {
-            Safefree(buffer);
             croak("quiche_h3_recv_body() failed: %ld", (long) result);
         }
-        RETVAL = newSVpvn((const char *) buffer, (STRLEN) result);
-        Safefree(buffer);
+        buffer[result] = '\0';
+        SvCUR_set(RETVAL, (STRLEN) result);
+        SvREFCNT_inc_simple_void_NN(RETVAL);
     OUTPUT:
         RETVAL
 
@@ -884,16 +927,19 @@ _h3_send_request(native_h3, native_connection, header_list, final)
         AV *header_list
         bool final
     PREINIT:
+        quiche_h3_conn *h3;
+        quiche_conn *conn;
         quiche_h3_header *headers;
         size_t header_count;
         int64_t result;
     CODE:
+        h3 = net_quiche_h3_handle_from_sv(aTHX_ native_h3)->conn;
+        conn = net_quiche_connection_handle_from_sv(
+            aTHX_ native_connection)->conn;
+        ENTER;
         headers = net_quiche_headers_from_av(aTHX_ header_list, &header_count);
-        result = quiche_h3_send_request(
-            net_quiche_h3_handle_from_sv(aTHX_ native_h3)->conn,
-            net_quiche_connection_handle_from_sv(aTHX_ native_connection)->conn,
-            headers, header_count, final);
-        Safefree(headers);
+        result = quiche_h3_send_request(h3, conn, headers, header_count, final);
+        LEAVE;
         if (result == QUICHE_H3_ERR_DONE ||
                 result == QUICHE_H3_ERR_STREAM_BLOCKED) {
             XSRETURN_UNDEF;
@@ -913,16 +959,20 @@ _h3_send_response(native_h3, native_connection, stream_id, header_list, final)
         AV *header_list
         bool final
     PREINIT:
+        quiche_h3_conn *h3;
+        quiche_conn *conn;
         quiche_h3_header *headers;
         size_t header_count;
         int result;
     CODE:
+        h3 = net_quiche_h3_handle_from_sv(aTHX_ native_h3)->conn;
+        conn = net_quiche_connection_handle_from_sv(
+            aTHX_ native_connection)->conn;
+        ENTER;
         headers = net_quiche_headers_from_av(aTHX_ header_list, &header_count);
         result = quiche_h3_send_response(
-            net_quiche_h3_handle_from_sv(aTHX_ native_h3)->conn,
-            net_quiche_connection_handle_from_sv(aTHX_ native_connection)->conn,
-            (uint64_t) stream_id, headers, header_count, final);
-        Safefree(headers);
+            h3, conn, (uint64_t) stream_id, headers, header_count, final);
+        LEAVE;
         if (result == QUICHE_H3_ERR_DONE ||
                 result == QUICHE_H3_ERR_STREAM_BLOCKED) {
             XSRETURN_UNDEF;

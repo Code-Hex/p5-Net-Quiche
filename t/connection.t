@@ -29,7 +29,8 @@ ok(!$client->is_established, 'client starts handshaking');
 ok(!$client->is_closed, 'new client is open');
 is($client->source_connection_id, 'client-source-id', 'source ID is copied back');
 ok(length($client->destination_connection_id) > 0, 'client has a destination ID');
-cmp_ok($client->timeout_ms, '>=', 0, 'handshake exposes an event-loop timeout');
+is($client->timeout_ms, undef,
+    'timeout_ms reports no timer before the first flight is sent');
 ok(!$client->shutdown_stream(
     0, direction => 'read', error_code => 0x10c,
 ), 'shutdown_stream reports an unopened stream as already done');
@@ -37,8 +38,12 @@ eval { $client->shutdown_stream(0, direction => 'sideways', error_code => 0) };
 like($@, qr/direction must be 'read' or 'write'/,
     'shutdown_stream validates its direction before entering XS');
 eval { $client->shutdown_stream(0, direction => 'read', error_code => -1) };
-like($@, qr/error_code must be a non-negative integer/,
+like($@, qr/error_code must be an integer from 0 to 2\^62-1/,
     'shutdown_stream validates its wire error code');
+eval { $client->shutdown_stream(
+    0, direction => 'read', error_code => 4_611_686_018_427_387_904) };
+like($@, qr/error_code must be an integer from 0 to 2\^62-1/,
+    'shutdown_stream rejects an error code that does not fit a varint');
 
 my $closing = Net::Quiche::Connection->connect(
     config               => $client_config,

@@ -15,30 +15,47 @@ sub _new {
     my $connection = $options{connection};
     croak '_new() requires a Net::Quiche::Connection'
         unless eval { $connection->isa('Net::Quiche::Connection') };
+    my $session = $options{session} || {};
+    $session->{native} ||= Net::Quiche::XS::_h3_new($connection->_native);
+    $session->{data_stream} = undef unless exists $session->{data_stream};
     return bless {
         connection => $connection,
-        native     => Net::Quiche::XS::_h3_new($connection->_native),
-        data_stream => undef,
+        native     => $session->{native},
+        session    => $session,
     }, $class;
 }
 
 sub poll {
-    croak 'poll() takes no arguments' unless @_ == 1;
-    my ($self) = @_;
+    my ($self, @arguments) = @_;
+    my %options = _options('poll', @arguments);
+    _unknown('poll', \%options, { read_body => 1 });
+    my $read_body = exists($options{read_body})
+        ? _boolean('read_body', $options{read_body}) : 1;
+    my $session = $self->{session};
 
-    if (defined $self->{data_stream}) {
-        my $body = Net::Quiche::XS::_h3_receive_body(
-            $self->{native}, $self->{connection}->_native,
-            $self->{data_stream}, $BODY_CHUNK_SIZE,
-        );
+    if (defined(my $stream_id = $session->{data_stream})) {
+        # Clear the cursor first. If the read fails, later polls must still
+        # reach the other streams instead of retrying this one forever.
+        $session->{data_stream} = undef;
+        my $body;
+        my $ok = eval {
+            $body = $self->recv_body($stream_id, $BODY_CHUNK_SIZE);
+            1;
+        };
+        if (!$ok) {
+            my $error = $@;
+            return { type => 'reset', stream_id => $stream_id }
+                if _is_stream_error($error);
+            die $error;
+        }
         if (defined $body) {
+            $session->{data_stream} = $stream_id;
             return {
                 type      => 'data',
-                stream_id => $self->{data_stream},
+                stream_id => $stream_id,
                 body      => $body,
             };
         }
-        $self->{data_stream} = undef;
     }
 
     my $event = Net::Quiche::XS::_h3_poll(
@@ -58,11 +75,25 @@ sub poll {
         };
     }
     if ($type eq 'data') {
-        $self->{data_stream} = $stream_id;
+        return { type => $type, stream_id => $stream_id } unless $read_body;
+        $session->{data_stream} = $stream_id;
         return $self->poll;
     }
     return { type => $type, id => $stream_id } if $type eq 'goaway';
     return { type => $type, stream_id => $stream_id };
+}
+
+sub recv_body {
+    my ($self, $stream_id, $max_bytes) = @_;
+    $stream_id = _stream_id($stream_id);
+    $max_bytes = $BODY_CHUNK_SIZE unless defined $max_bytes;
+    croak 'max_bytes must be a positive integer'
+        if ref($max_bytes) || $max_bytes !~ /\A[1-9][0-9]*\z/
+            || length($max_bytes) > 10;
+    return Net::Quiche::XS::_h3_receive_body(
+        $self->{native}, $self->{connection}->_native,
+        $stream_id, 0 + $max_bytes,
+    );
 }
 
 sub send_request {
@@ -119,17 +150,27 @@ sub send_goaway {
 
 sub _forget_stream {
     my ($self, $stream_id) = @_;
-    $self->{data_stream} = undef
-        if defined($self->{data_stream}) && $self->{data_stream} == $stream_id;
+    my $session = $self->{session};
+    $session->{data_stream} = undef
+        if defined($session->{data_stream})
+            && $session->{data_stream} == $stream_id;
     return;
+}
+
+# quiche's HTTP/3 C API reports a transport error as the QUIC error minus
+# 1000: STREAM_STOPPED (-15) and STREAM_RESET (-16) affect one stream only.
+sub _is_stream_error {
+    my ($error) = @_;
+    return $error =~ /\Aquiche_h3_\w+\(\) failed: -101[56]\b/ ? 1 : 0;
 }
 
 sub CLONE_SKIP { 1 }
 
 sub DESTROY {
     my ($self) = @_;
-    # quiche requires the HTTP/3 handle to die before its transport handle.
+    # The native session is shared with the connection; only drop references.
     delete $self->{native};
+    delete $self->{session};
     delete $self->{connection};
 }
 
@@ -214,6 +255,15 @@ C<stream_id>, so a PAGI adapter can create one HTTP scope per request while
 retaining one shared QUIC connection. A GOAWAY event contains C<id> because it
 applies to the connection, not one request stream. Header order and duplicates
 are preserved.
+
+By default C<poll> reads the body of each C<data> event and returns it in
+C<body>. With C<< read_body =E<gt> 0 >> a C<data> event has no C<body>; call
+C<recv_body($stream_id, $max_bytes)> until it returns undef. Unread data
+stays in quiche and holds back the peer's flow-control window. quiche reports
+C<data> again only after the buffered body has been read to the end, and
+C<finished> only follows once the whole body has been read. If the peer
+resets a stream while its body is being read, C<poll> returns a C<reset>
+event for that stream instead of dying.
 
 C<send_body> returns the number of body bytes accepted by quiche. This can be
 shorter than the supplied body. C<send_request>, C<send_response>, and
